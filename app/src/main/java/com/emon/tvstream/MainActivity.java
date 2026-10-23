@@ -2,6 +2,7 @@ package com.emon.tvstream;
 
 import android.app.Activity;
 import android.content.Intent;
+import android.media.AudioManager;
 import android.net.Uri;
 import android.os.Build;
 import android.provider.Settings;
@@ -52,6 +53,14 @@ public class MainActivity extends Activity {
     private static final String KEY_URL = "url";
     private static final String KEY_CURSOR = "cursor";
     private static final String KEY_UA = "uamode";
+    private static final String KEY_PLAYER = "playerpref";
+    // Finds a video or embedded player that fills (almost) the whole screen.
+    private static final String DETECT_JS =
+            "(function(){var w=window.innerWidth,h=window.innerHeight;"
+                    + "var els=document.querySelectorAll('video,iframe');"
+                    + "for(var i=0;i<els.length;i++){var r=els[i].getBoundingClientRect();"
+                    + "if(r.width>=w*0.92&&r.height>=h*0.92&&r.left<=w*0.04&&r.top<=h*0.04)return 1;}"
+                    + "return 0;})();";
     private static final String UA_DESKTOP =
             "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) "
                     + "Chrome/130.0.0.0 Safari/537.36";
@@ -75,6 +84,27 @@ public class MainActivity extends Activity {
     private String defaultUa = "";
 
     private boolean cursorMode = true;
+    private int playerPref = 0; // 0 = auto, 1 = always on, 2 = always off
+    private boolean pseudoFull = false;
+    private boolean cursorOverride = false;
+    private boolean selDown = false;
+    private boolean selLong = false;
+
+    private final Runnable pollRunnable = new Runnable() {
+        @Override
+        public void run() {
+            if (playerPref == 0 && customView == null && webView != null) {
+                webView.evaluateJavascript(DETECT_JS, v -> {
+                    boolean full = "1".equals(v);
+                    if (full != pseudoFull) {
+                        pseudoFull = full;
+                        refreshCursorVisibility();
+                    }
+                });
+            }
+            handler.postDelayed(this, 1500);
+        }
+    };
     private float cx, cy;
     private float density = 1f;
 
@@ -116,7 +146,8 @@ public class MainActivity extends Activity {
         cursorView = new CursorView(this);
         root.addView(cursorView, new FrameLayout.LayoutParams(
                 ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.MATCH_PARENT));
-        cursorView.setVisibility(cursorMode ? View.VISIBLE : View.GONE);
+        playerPref = prefs.getInt(KEY_PLAYER, 0);
+        refreshCursorVisibility();
 
         String url = prefs.getString(KEY_URL, null);
         if (url == null) {
@@ -172,6 +203,7 @@ public class MainActivity extends Activity {
                 root.addView(view, new FrameLayout.LayoutParams(
                         ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.MATCH_PARENT));
                 if (cursorView != null) cursorView.bringToFront();
+                refreshCursorVisibility();
             }
 
             @Override
@@ -181,6 +213,7 @@ public class MainActivity extends Activity {
                 customView = null;
                 if (customCallback != null) customCallback.onCustomViewHidden();
                 customCallback = null;
+                refreshCursorVisibility();
             }
         };
         webView.setWebChromeClient(chromeClient);
@@ -192,6 +225,7 @@ public class MainActivity extends Activity {
     public boolean dispatchKeyEvent(KeyEvent e) {
         int code = e.getKeyCode();
         boolean down = e.getAction() == KeyEvent.ACTION_DOWN;
+        boolean player = playerMode();
 
         if (code == KeyEvent.KEYCODE_MENU) {
             if (down && e.getRepeatCount() == 0) showMenu();
@@ -200,44 +234,91 @@ public class MainActivity extends Activity {
 
         switch (code) {
             case KeyEvent.KEYCODE_MEDIA_PLAY_PAUSE:
-                if (down && e.getRepeatCount() == 0)
-                    videoJs("if(v.paused){v.play();}else{v.pause();}");
+                if (down && e.getRepeatCount() == 0) togglePlay();
                 return true;
             case KeyEvent.KEYCODE_MEDIA_PLAY:
-                if (down) videoJs("v.play();");
-                return true;
             case KeyEvent.KEYCODE_MEDIA_PAUSE:
-                if (down) videoJs("v.pause();");
+                if (down && e.getRepeatCount() == 0) togglePlay();
                 return true;
             case KeyEvent.KEYCODE_MEDIA_FAST_FORWARD:
-                if (down) videoJs("v.currentTime=v.currentTime+10;");
+                if (down) {
+                    if (player) seek(10);
+                    else scrollPage(0, (int) (root.getHeight() * 0.7f));
+                }
                 return true;
             case KeyEvent.KEYCODE_MEDIA_REWIND:
-                if (down) videoJs("v.currentTime=Math.max(0,v.currentTime-10);");
+                if (down) {
+                    if (player) seek(-10);
+                    else scrollPage(0, -(int) (root.getHeight() * 0.7f));
+                }
                 return true;
             default:
                 break;
         }
 
-        if (cursorMode) {
-            switch (code) {
-                case KeyEvent.KEYCODE_DPAD_UP:
-                case KeyEvent.KEYCODE_DPAD_DOWN:
-                case KeyEvent.KEYCODE_DPAD_LEFT:
-                case KeyEvent.KEYCODE_DPAD_RIGHT:
+        boolean isSelect = code == KeyEvent.KEYCODE_DPAD_CENTER
+                || code == KeyEvent.KEYCODE_ENTER
+                || code == KeyEvent.KEYCODE_NUMPAD_ENTER
+                || code == KeyEvent.KEYCODE_BUTTON_A;
+        boolean isDpad = code == KeyEvent.KEYCODE_DPAD_UP
+                || code == KeyEvent.KEYCODE_DPAD_DOWN
+                || code == KeyEvent.KEYCODE_DPAD_LEFT
+                || code == KeyEvent.KEYCODE_DPAD_RIGHT;
+
+        if (player) {
+            // Video is full screen: the remote controls the player.
+            // Tap Select = play/pause. Hold Select = show/hide the cursor
+            // (for subtitle / quality buttons inside the player).
+            if (isSelect) {
+                handlePlayerSelect(e, down);
+                return true;
+            }
+            if (isDpad) {
+                if (cursorOverride) {
                     if (down) moveCursor(code, e.getRepeatCount());
-                    return true;
-                case KeyEvent.KEYCODE_DPAD_CENTER:
-                case KeyEvent.KEYCODE_ENTER:
-                case KeyEvent.KEYCODE_NUMPAD_ENTER:
-                case KeyEvent.KEYCODE_BUTTON_A:
-                    if (down && e.getRepeatCount() == 0) clickAtCursor();
-                    return true;
-                default:
-                    break;
+                } else if (down) {
+                    if (code == KeyEvent.KEYCODE_DPAD_LEFT) seek(-10);
+                    else if (code == KeyEvent.KEYCODE_DPAD_RIGHT) seek(10);
+                    else if (code == KeyEvent.KEYCODE_DPAD_UP) changeVolume(true);
+                    else changeVolume(false);
+                }
+                return true;
+            }
+        } else if (cursorMode) {
+            if (isDpad) {
+                if (down) moveCursor(code, e.getRepeatCount());
+                return true;
+            }
+            if (isSelect) {
+                if (down && e.getRepeatCount() == 0) clickAtCursor();
+                return true;
             }
         }
         return super.dispatchKeyEvent(e);
+    }
+
+    private void handlePlayerSelect(KeyEvent e, boolean down) {
+        if (down) {
+            if (e.getRepeatCount() == 0) {
+                selDown = true;
+                selLong = false;
+            } else if (selDown && !selLong) {
+                // Held down: toggle the cursor.
+                selLong = true;
+                cursorOverride = !cursorOverride;
+                refreshCursorVisibility();
+                Toast.makeText(this, cursorOverride
+                        ? "Cursor ON (hold Select to hide)"
+                        : "Cursor OFF", Toast.LENGTH_SHORT).show();
+            }
+        } else {
+            if (selDown && !selLong) {
+                if (cursorOverride) clickAtCursor();
+                else togglePlay();
+            }
+            selDown = false;
+            selLong = false;
+        }
     }
 
     @Override
@@ -253,19 +334,81 @@ public class MainActivity extends Activity {
         showMenu();
     }
 
-    private void videoJs(String body) {
+    // ------------------------------------------------------ player control
+
+    private boolean playerMode() {
+        if (customView != null) return true;
+        if (playerPref == 1) return true;
+        if (playerPref == 2) return false;
+        return pseudoFull;
+    }
+
+    private void refreshCursorVisibility() {
+        if (cursorView == null) return;
+        boolean player = playerMode();
+        if (!player) cursorOverride = false;
+        boolean show = player ? cursorOverride : cursorMode;
+        cursorView.setVisibility(show ? View.VISIBLE : View.GONE);
+        cursorView.invalidate();
+    }
+
+    private void togglePlay() {
+        videoJs("if(v.paused){v.play();}else{v.pause();}", KeyEvent.KEYCODE_SPACE);
+    }
+
+    private void seek(int seconds) {
+        videoJs("v.currentTime=Math.max(0,v.currentTime+(" + seconds + "));",
+                seconds > 0 ? KeyEvent.KEYCODE_DPAD_RIGHT : KeyEvent.KEYCODE_DPAD_LEFT);
+    }
+
+    private void changeVolume(boolean up) {
+        AudioManager am = (AudioManager) getSystemService(Context.AUDIO_SERVICE);
+        if (am == null) return;
+        am.adjustStreamVolume(AudioManager.STREAM_MUSIC,
+                up ? AudioManager.ADJUST_RAISE : AudioManager.ADJUST_LOWER,
+                AudioManager.FLAG_SHOW_UI);
+    }
+
+    // Runs on a <video> in the page. If the video lives inside another site's
+    // iframe the page can't be reached, so a plain key press is sent instead.
+    private void videoJs(String body, final int fallbackKey) {
         String js = "(function(){var vs=document.getElementsByTagName('video');var v=null;"
                 + "for(var i=0;i<vs.length;i++){if(!vs[i].paused){v=vs[i];break;}}"
-                + "if(!v)v=vs[0];if(!v)return;" + body + "})();";
+                + "if(!v)v=vs[0];if(!v)return 0;" + body + "return 1;})();";
+        webView.evaluateJavascript(js, value -> {
+            if (!"1".equals(value) && fallbackKey != 0) sendKeyToPage(fallbackKey);
+        });
+    }
+
+    private void sendKeyToPage(int keyCode) {
+        long t = SystemClock.uptimeMillis();
+        webView.dispatchKeyEvent(new KeyEvent(t, t, KeyEvent.ACTION_DOWN, keyCode, 0));
+        webView.dispatchKeyEvent(new KeyEvent(t, t + 20, KeyEvent.ACTION_UP, keyCode, 0));
+    }
+
+    // Scrolls whatever is under the cursor (page or an inner scroll box).
+    private void scrollPage(int dxPx, int dyPx) {
+        String js = "(function(x,y,dx,dy){var r=window.devicePixelRatio||1;dx=dx/r;dy=dy/r;"
+                + "function can(el){var cs=getComputedStyle(el);"
+                + "if(dy>0&&/(auto|scroll)/.test(cs.overflowY)&&el.scrollTop+el.clientHeight<el.scrollHeight-1)return true;"
+                + "if(dy<0&&/(auto|scroll)/.test(cs.overflowY)&&el.scrollTop>0)return true;"
+                + "if(dx>0&&/(auto|scroll)/.test(cs.overflowX)&&el.scrollLeft+el.clientWidth<el.scrollWidth-1)return true;"
+                + "if(dx<0&&/(auto|scroll)/.test(cs.overflowX)&&el.scrollLeft>0)return true;"
+                + "return false;}"
+                + "var el=document.elementFromPoint(x/r,y/r);"
+                + "while(el&&el!==document.documentElement){"
+                + "if(can(el)){el.scrollBy(dx,dy);return;}el=el.parentElement;}"
+                + "window.scrollBy(dx,dy);})("
+                + (int) cx + "," + (int) cy + "," + dxPx + "," + dyPx + ");";
         webView.evaluateJavascript(js, null);
     }
 
     // -------------------------------------------------------------- cursor
 
     private void moveCursor(int keyCode, int repeat) {
-        float step = (10 + Math.min(repeat, 25) * 3) * density;
+        float step = (14 + Math.min(repeat, 30) * 5) * density;
         int scrollStep = (int) (step * 2);
-        float edge = 48 * density;
+        float edge = 64 * density;
         int w = root.getWidth();
         int h = root.getHeight();
         if (w == 0 || h == 0) return;
@@ -281,16 +424,17 @@ public class MainActivity extends Activity {
 
         float nx = cx + dx;
         float ny = cy + dy;
-
-        // Near a screen edge: also scroll the page in that direction.
-        if (dy < 0 && ny < edge) webView.scrollBy(0, -scrollStep);
-        if (dy > 0 && ny > h - edge) webView.scrollBy(0, scrollStep);
-        if (dx < 0 && nx < edge) webView.scrollBy(-scrollStep, 0);
-        if (dx > 0 && nx > w - edge) webView.scrollBy(scrollStep, 0);
-
         cx = Math.max(0, Math.min(w - 1, nx));
         cy = Math.max(0, Math.min(h - 1, ny));
         cursorView.invalidate();
+
+        // Near a screen edge: scroll the page too (not while a video is full screen).
+        if (!playerMode()) {
+            if (dy < 0 && ny < edge) scrollPage(0, -scrollStep);
+            else if (dy > 0 && ny > h - edge) scrollPage(0, scrollStep);
+            else if (dx < 0 && nx < edge) scrollPage(-scrollStep, 0);
+            else if (dx > 0 && nx > w - edge) scrollPage(scrollStep, 0);
+        }
     }
 
     private void clickAtCursor() {
@@ -338,6 +482,12 @@ public class MainActivity extends Activity {
 
     // ---------------------------------------------------------------- menu
 
+    private String playerPrefName(int v) {
+        if (v == 1) return "Always ON";
+        if (v == 2) return "Always OFF";
+        return "Auto";
+    }
+
     private void showMenu() {
         if (menuDialog != null && menuDialog.isShowing()) return;
         String[] items = {
@@ -346,6 +496,7 @@ public class MainActivity extends Activity {
                 "Reload page",
                 "Clear cache & cookies",
                 "Cursor mode: " + (cursorMode ? "ON (tap to turn off)" : "OFF (tap to turn on)"),
+                "Player controls: " + playerPrefName(playerPref) + " (tap to switch)",
                 "Browser mode: " + uaName(prefs.getInt(KEY_UA, 1)) + " (tap to switch)",
                 "Check for updates (installed: build " + BuildConfig.VERSION_CODE + ")",
                 "Exit app"
@@ -375,19 +526,27 @@ public class MainActivity extends Activity {
                         case 4:
                             cursorMode = !cursorMode;
                             prefs.edit().putBoolean(KEY_CURSOR, cursorMode).apply();
-                            cursorView.setVisibility(cursorMode ? View.VISIBLE : View.GONE);
+                            refreshCursorVisibility();
                             break;
                         case 5:
+                            playerPref = (playerPref + 1) % 3;
+                            prefs.edit().putInt(KEY_PLAYER, playerPref).apply();
+                            pseudoFull = false;
+                            refreshCursorVisibility();
+                            Toast.makeText(this, "Player controls: " + playerPrefName(playerPref),
+                                    Toast.LENGTH_SHORT).show();
+                            break;
+                        case 6:
                             int next = (prefs.getInt(KEY_UA, 1) + 1) % 3;
                             prefs.edit().putInt(KEY_UA, next).apply();
                             applyUserAgent();
                             Toast.makeText(this, "Browser mode: " + uaName(next), Toast.LENGTH_SHORT).show();
                             webView.reload();
                             break;
-                        case 6:
+                        case 7:
                             checkForUpdates(true);
                             break;
-                        case 7:
+                        case 8:
                             finish();
                             break;
                         default:
@@ -618,6 +777,7 @@ public class MainActivity extends Activity {
     @Override
     protected void onPause() {
         super.onPause();
+        handler.removeCallbacks(pollRunnable);
         webView.onPause();
     }
 
@@ -625,6 +785,8 @@ public class MainActivity extends Activity {
     protected void onResume() {
         super.onResume();
         webView.onResume();
+        handler.removeCallbacks(pollRunnable);
+        handler.postDelayed(pollRunnable, 1500);
     }
 
     @Override
