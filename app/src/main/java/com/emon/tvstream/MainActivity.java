@@ -12,6 +12,7 @@ import android.os.Handler;
 import android.os.Looper;
 import android.os.SystemClock;
 import android.text.InputType;
+import android.view.Gravity;
 import android.view.InputDevice;
 import android.view.KeyEvent;
 import android.view.MotionEvent;
@@ -28,6 +29,7 @@ import android.webkit.WebView;
 import android.webkit.WebViewClient;
 import android.widget.EditText;
 import android.widget.FrameLayout;
+import android.widget.TextView;
 import android.widget.Toast;
 
 public class MainActivity extends Activity {
@@ -42,6 +44,7 @@ public class MainActivity extends Activity {
     private FrameLayout root;
     private WebView webView;
     private CursorView cursorView;
+    private TextView menuButton;
     private WebChromeClient chromeClient;
 
     private View customView;
@@ -52,7 +55,6 @@ public class MainActivity extends Activity {
     private boolean cursorMode = true;
     private float cx, cy;
     private float density = 1f;
-    private long lastBack = 0;
 
     @Override
     protected void onCreate(Bundle savedInstanceState) {
@@ -73,6 +75,21 @@ public class MainActivity extends Activity {
         root.addView(webView, new FrameLayout.LayoutParams(
                 ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.MATCH_PARENT));
         setupWebView();
+
+        menuButton = new TextView(this);
+        menuButton.setText("\u2630  Menu");
+        menuButton.setTextColor(Color.WHITE);
+        menuButton.setTextSize(16);
+        menuButton.setPadding((int) (14 * density), (int) (8 * density),
+                (int) (14 * density), (int) (8 * density));
+        menuButton.setBackgroundColor(0x99000000);
+        menuButton.setClickable(true);
+        menuButton.setOnClickListener(v -> showMenu());
+        FrameLayout.LayoutParams mlp = new FrameLayout.LayoutParams(
+                ViewGroup.LayoutParams.WRAP_CONTENT, ViewGroup.LayoutParams.WRAP_CONTENT,
+                Gravity.TOP | Gravity.END);
+        mlp.setMargins(0, (int) (12 * density), (int) (12 * density), 0);
+        root.addView(menuButton, mlp);
 
         cursorView = new CursorView(this);
         root.addView(cursorView, new FrameLayout.LayoutParams(
@@ -98,6 +115,8 @@ public class MainActivity extends Activity {
         s.setSupportMultipleWindows(false);
         s.setJavaScriptCanOpenWindowsAutomatically(false);
         s.setAllowFileAccess(false);
+        String ua = s.getUserAgentString();
+        if (ua != null) s.setUserAgentString(ua.replace("; wv", ""));
 
         CookieManager cm = CookieManager.getInstance();
         cm.setAcceptCookie(true);
@@ -206,13 +225,7 @@ public class MainActivity extends Activity {
             webView.goBack();
             return;
         }
-        long now = SystemClock.elapsedRealtime();
-        if (now - lastBack < 2000) {
-            finish();
-        } else {
-            lastBack = now;
-            Toast.makeText(this, "Press Back again to exit", Toast.LENGTH_SHORT).show();
-        }
+        showMenu();
     }
 
     private void videoJs(String body) {
@@ -256,7 +269,7 @@ public class MainActivity extends Activity {
     }
 
     private void clickAtCursor() {
-        final View target = (customView != null) ? customView : webView;
+        final View target = root;
         final float x = cx;
         final float y = cy;
         final long downTime = SystemClock.uptimeMillis();
