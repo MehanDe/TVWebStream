@@ -1,6 +1,20 @@
 package com.emon.tvstream;
 
 import android.app.Activity;
+import android.content.Intent;
+import android.net.Uri;
+import android.os.Build;
+import android.provider.Settings;
+import androidx.core.content.FileProvider;
+import org.json.JSONArray;
+import org.json.JSONObject;
+import java.io.ByteArrayOutputStream;
+import java.io.File;
+import java.io.FileOutputStream;
+import java.io.IOException;
+import java.io.InputStream;
+import java.net.HttpURLConnection;
+import java.net.URL;
 import android.app.AlertDialog;
 import android.content.Context;
 import android.content.SharedPreferences;
@@ -37,6 +51,13 @@ public class MainActivity extends Activity {
     private static final String PREFS = "tvstream";
     private static final String KEY_URL = "url";
     private static final String KEY_CURSOR = "cursor";
+    private static final String KEY_UA = "uamode";
+    private static final String UA_DESKTOP =
+            "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) "
+                    + "Chrome/130.0.0.0 Safari/537.36";
+    private static final String UA_PHONE =
+            "Mozilla/5.0 (Linux; Android 13; Pixel 7) AppleWebKit/537.36 (KHTML, like Gecko) "
+                    + "Chrome/130.0.0.0 Mobile Safari/537.36";
 
     private final Handler handler = new Handler(Looper.getMainLooper());
 
@@ -51,6 +72,7 @@ public class MainActivity extends Activity {
     private WebChromeClient.CustomViewCallback customCallback;
 
     private AlertDialog menuDialog;
+    private String defaultUa = "";
 
     private boolean cursorMode = true;
     private float cx, cy;
@@ -102,6 +124,8 @@ public class MainActivity extends Activity {
         } else {
             webView.loadUrl(url);
         }
+
+        handler.postDelayed(() -> checkForUpdates(false), 4000);
     }
 
     private void setupWebView() {
@@ -116,7 +140,8 @@ public class MainActivity extends Activity {
         s.setJavaScriptCanOpenWindowsAutomatically(false);
         s.setAllowFileAccess(false);
         String ua = s.getUserAgentString();
-        if (ua != null) s.setUserAgentString(ua.replace("; wv", ""));
+        defaultUa = (ua == null) ? "" : ua.replace("; wv", "");
+        applyUserAgent();
 
         CookieManager cm = CookieManager.getInstance();
         cm.setAcceptCookie(true);
@@ -321,6 +346,8 @@ public class MainActivity extends Activity {
                 "Reload page",
                 "Clear cache & cookies",
                 "Cursor mode: " + (cursorMode ? "ON (tap to turn off)" : "OFF (tap to turn on)"),
+                "Browser mode: " + uaName(prefs.getInt(KEY_UA, 1)) + " (tap to switch)",
+                "Check for updates (installed: build " + BuildConfig.VERSION_CODE + ")",
                 "Exit app"
         };
         menuDialog = new AlertDialog.Builder(this, AlertDialog.THEME_DEVICE_DEFAULT_DARK)
@@ -351,6 +378,16 @@ public class MainActivity extends Activity {
                             cursorView.setVisibility(cursorMode ? View.VISIBLE : View.GONE);
                             break;
                         case 5:
+                            int next = (prefs.getInt(KEY_UA, 1) + 1) % 3;
+                            prefs.edit().putInt(KEY_UA, next).apply();
+                            applyUserAgent();
+                            Toast.makeText(this, "Browser mode: " + uaName(next), Toast.LENGTH_SHORT).show();
+                            webView.reload();
+                            break;
+                        case 6:
+                            checkForUpdates(true);
+                            break;
+                        case 7:
                             finish();
                             break;
                         default:
@@ -359,6 +396,21 @@ public class MainActivity extends Activity {
                 })
                 .create();
         menuDialog.show();
+    }
+
+    // 0 = TV default, 1 = Desktop Chrome, 2 = Phone Chrome
+    private void applyUserAgent() {
+        int mode = prefs.getInt(KEY_UA, 1);
+        WebSettings s = webView.getSettings();
+        if (mode == 1) s.setUserAgentString(UA_DESKTOP);
+        else if (mode == 2) s.setUserAgentString(UA_PHONE);
+        else s.setUserAgentString(defaultUa);
+    }
+
+    private String uaName(int mode) {
+        if (mode == 1) return "Desktop";
+        if (mode == 2) return "Phone";
+        return "TV default";
     }
 
     private void promptForUrl(final boolean firstRun) {
@@ -412,6 +464,139 @@ public class MainActivity extends Activity {
             return null;
         }
         return u;
+    }
+
+    // ------------------------------------------------------------- updates
+
+    private HttpURLConnection openConnection(String u) throws IOException {
+        HttpURLConnection c = (HttpURLConnection) new URL(u).openConnection();
+        c.setConnectTimeout(15000);
+        c.setReadTimeout(30000);
+        c.setRequestProperty("User-Agent", "TVStream-Updater");
+        return c;
+    }
+
+    private String readAll(InputStream in) throws IOException {
+        ByteArrayOutputStream out = new ByteArrayOutputStream();
+        byte[] buf = new byte[8192];
+        int n;
+        while ((n = in.read(buf)) != -1) out.write(buf, 0, n);
+        in.close();
+        return out.toString("UTF-8");
+    }
+
+    private void checkForUpdates(final boolean manual) {
+        if (BuildConfig.REPO.isEmpty()) {
+            if (manual) {
+                Toast.makeText(this, "Updates only work for builds made by GitHub", Toast.LENGTH_LONG).show();
+            }
+            return;
+        }
+        if (manual) Toast.makeText(this, "Checking for updates...", Toast.LENGTH_SHORT).show();
+
+        new Thread(() -> {
+            try {
+                HttpURLConnection c = openConnection(
+                        "https://api.github.com/repos/" + BuildConfig.REPO + "/releases?per_page=15");
+                c.setRequestProperty("Accept", "application/vnd.github+json");
+                if (c.getResponseCode() != 200) {
+                    throw new IOException("GitHub replied " + c.getResponseCode());
+                }
+                JSONArray releases = new JSONArray(readAll(c.getInputStream()));
+                int bestBuild = -1;
+                String bestUrl = null;
+                for (int i = 0; i < releases.length(); i++) {
+                    JSONObject r = releases.getJSONObject(i);
+                    if (r.optBoolean("draft")) continue;
+                    String digits = r.optString("tag_name", "").replaceAll("[^0-9]", "");
+                    if (digits.isEmpty() || digits.length() > 8) continue;
+                    int n = Integer.parseInt(digits);
+                    JSONArray assets = r.optJSONArray("assets");
+                    if (assets == null) continue;
+                    for (int j = 0; j < assets.length(); j++) {
+                        JSONObject a = assets.getJSONObject(j);
+                        if ("TVStream.apk".equals(a.optString("name")) && n > bestBuild) {
+                            bestBuild = n;
+                            bestUrl = a.optString("browser_download_url", null);
+                        }
+                    }
+                }
+                final int newBuild = bestBuild;
+                final String newUrl = bestUrl;
+                runOnUiThread(() -> {
+                    if (newUrl != null && newBuild > BuildConfig.VERSION_CODE) {
+                        showUpdateDialog(newBuild, newUrl);
+                    } else if (manual) {
+                        Toast.makeText(this, "You're up to date (build "
+                                + BuildConfig.VERSION_CODE + ")", Toast.LENGTH_LONG).show();
+                    }
+                });
+            } catch (Exception e) {
+                final String msg = String.valueOf(e.getMessage());
+                if (manual) {
+                    runOnUiThread(() -> Toast.makeText(this,
+                            "Update check failed: " + msg, Toast.LENGTH_LONG).show());
+                }
+            }
+        }).start();
+    }
+
+    private void showUpdateDialog(final int build, final String url) {
+        if (isFinishing()) return;
+        new AlertDialog.Builder(this, AlertDialog.THEME_DEVICE_DEFAULT_DARK)
+                .setTitle("Update available")
+                .setMessage("New version: build " + build + "\nInstalled: build "
+                        + BuildConfig.VERSION_CODE)
+                .setPositiveButton("Install now", (d, w) -> downloadAndInstall(url))
+                .setNegativeButton("Later", null)
+                .show();
+    }
+
+    private void downloadAndInstall(final String url) {
+        Toast.makeText(this, "Downloading update...", Toast.LENGTH_LONG).show();
+        new Thread(() -> {
+            try {
+                File dir = new File(getCacheDir(), "update");
+                dir.mkdirs();
+                final File out = new File(dir, "TVStream.apk");
+                HttpURLConnection c = openConnection(url);
+                if (c.getResponseCode() != 200) {
+                    throw new IOException("Download replied " + c.getResponseCode());
+                }
+                InputStream in = c.getInputStream();
+                FileOutputStream fos = new FileOutputStream(out);
+                byte[] buf = new byte[16384];
+                int n;
+                while ((n = in.read(buf)) != -1) fos.write(buf, 0, n);
+                fos.close();
+                in.close();
+                runOnUiThread(() -> installApk(out));
+            } catch (Exception e) {
+                final String msg = String.valueOf(e.getMessage());
+                runOnUiThread(() -> Toast.makeText(this,
+                        "Download failed: " + msg, Toast.LENGTH_LONG).show());
+            }
+        }).start();
+    }
+
+    private void installApk(File apk) {
+        try {
+            if (Build.VERSION.SDK_INT >= 26 && !getPackageManager().canRequestPackageInstalls()) {
+                Toast.makeText(this,
+                        "Turn ON 'Install unknown apps' for TV Stream, press Back, then check for updates again",
+                        Toast.LENGTH_LONG).show();
+                startActivity(new Intent(Settings.ACTION_MANAGE_UNKNOWN_APP_SOURCES,
+                        Uri.parse("package:" + getPackageName())));
+                return;
+            }
+            Uri uri = FileProvider.getUriForFile(this, getPackageName() + ".fileprovider", apk);
+            Intent i = new Intent(Intent.ACTION_VIEW);
+            i.setDataAndType(uri, "application/vnd.android.package-archive");
+            i.addFlags(Intent.FLAG_GRANT_READ_URI_PERMISSION | Intent.FLAG_ACTIVITY_NEW_TASK);
+            startActivity(i);
+        } catch (Exception e) {
+            Toast.makeText(this, "Install failed: " + e.getMessage(), Toast.LENGTH_LONG).show();
+        }
     }
 
     // ----------------------------------------------------------- lifecycle

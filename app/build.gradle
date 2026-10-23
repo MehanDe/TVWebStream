@@ -2,6 +2,10 @@ plugins {
     id 'com.android.application'
 }
 
+// Set automatically by GitHub Actions; defaults are for local builds.
+def repoSlug = System.getenv('GITHUB_REPOSITORY') ?: ''
+def buildNumber = (System.getenv('GITHUB_RUN_NUMBER') ?: '1').toInteger()
+
 android {
     namespace 'com.emon.tvstream'
     compileSdk 34
@@ -10,11 +14,29 @@ android {
         applicationId "com.emon.tvstream"
         minSdk 22
         targetSdk 34
-        versionCode 1
-        versionName "1.0"
+        versionCode buildNumber
+        versionName "1.${buildNumber}"
+        buildConfigField "String", "REPO", "\"${repoSlug}\""
+    }
+
+    buildFeatures {
+        buildConfig true
+    }
+
+    // Same key on every build, so new versions can install over old ones.
+    signingConfigs {
+        stable {
+            storeFile file('stable.keystore')
+            storePassword 'tvstream123'
+            keyAlias 'tvstream'
+            keyPassword 'tvstream123'
+        }
     }
 
     buildTypes {
+        debug {
+            signingConfig signingConfigs.stable
+        }
         release {
             minifyEnabled false
         }
@@ -24,4 +46,8 @@ android {
         sourceCompatibility JavaVersion.VERSION_17
         targetCompatibility JavaVersion.VERSION_17
     }
+}
+
+dependencies {
+    implementation 'androidx.core:core:1.13.1'
 }
