@@ -1,2 +1,3 @@
-# TVWebStream
-This apk will fetch or work as a webview for my TV
+# TV Stream (Fire TV)
+Opens your website full screen. Menu button on the remote = change website, reload, cursor mode, exit.
+Build: push to GitHub, the Actions tab builds TVStream.apk automatically.
