@@ -234,6 +234,12 @@
     return [x * k, y * k];
   };
 
+  // Page up / page down (used by the Rewind / Fast-forward buttons).
+  window.__tvPage = function (dir) {
+    scrollDir(cur && cur.isConnected ? cur : document.body, dir);
+    return 'page';
+  };
+
   window.__tvOff = function () {
     cur = null;
     if (ring) ring.style.display = 'none';
