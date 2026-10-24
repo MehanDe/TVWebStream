@@ -214,10 +214,10 @@ public class MainActivity extends Activity {
                 if (down && e.getRepeatCount() == 0) togglePlay();
                 return true;
             case KeyEvent.KEYCODE_MEDIA_FAST_FORWARD:
-                if (down) seek(10);
+                if (down) skipOrScroll(1);
                 return true;
             case KeyEvent.KEYCODE_MEDIA_REWIND:
-                if (down) seek(-10);
+                if (down) skipOrScroll(-1);
                 return true;
             default:
                 break;
@@ -334,6 +334,24 @@ public class MainActivity extends Activity {
 
     private void togglePlay() {
         videoJs("if(v.paused){v.play();}else{v.pause();}", KeyEvent.KEYCODE_SPACE);
+    }
+
+    // Fast-forward / Rewind: seek if a video is playing (or full screen),
+    // otherwise scroll the page down / up.
+    private void skipOrScroll(final int dir) {
+        if (customView != null) {
+            seek(dir * 10);
+            return;
+        }
+        String js = "(function(){var vs=document.getElementsByTagName('video');"
+                + "for(var i=0;i<vs.length;i++){if(!vs[i].paused){"
+                + "vs[i].currentTime=Math.max(0,vs[i].currentTime+(" + (dir * 10) + "));return 1;}}"
+                + "return 0;})();";
+        webView.evaluateJavascript(js, value -> {
+            if (!"1".equals(value)) {
+                runTile("window.__tvPage('" + (dir > 0 ? "down" : "up") + "')", v -> { });
+            }
+        });
     }
 
     private void seek(int seconds) {
