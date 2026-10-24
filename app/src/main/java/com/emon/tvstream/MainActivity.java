@@ -36,6 +36,7 @@ import android.view.ViewGroup;
 import android.view.WindowManager;
 import android.view.inputmethod.EditorInfo;
 import android.webkit.CookieManager;
+import android.webkit.ValueCallback;
 import android.webkit.WebChromeClient;
 import android.webkit.WebResourceRequest;
 import android.webkit.WebSettings;
@@ -53,14 +54,7 @@ public class MainActivity extends Activity {
     private static final String KEY_URL = "url";
     private static final String KEY_CURSOR = "cursor";
     private static final String KEY_UA = "uamode";
-    private static final String KEY_PLAYER = "playerpref";
-    // Finds a video or embedded player that fills (almost) the whole screen.
-    private static final String DETECT_JS =
-            "(function(){var w=window.innerWidth,h=window.innerHeight;"
-                    + "var els=document.querySelectorAll('video,iframe');"
-                    + "for(var i=0;i<els.length;i++){var r=els[i].getBoundingClientRect();"
-                    + "if(r.width>=w*0.92&&r.height>=h*0.92&&r.left<=w*0.04&&r.top<=h*0.04)return 1;}"
-                    + "return 0;})();";
+    private static final String KEY_NAV = "nav";
     private static final String UA_DESKTOP =
             "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) "
                     + "Chrome/130.0.0.0 Safari/537.36";
@@ -83,28 +77,10 @@ public class MainActivity extends Activity {
     private AlertDialog menuDialog;
     private String defaultUa = "";
 
-    private boolean cursorMode = true;
-    private int playerPref = 0; // 0 = auto, 1 = always on, 2 = always off
-    private boolean pseudoFull = false;
-    private boolean cursorOverride = false;
-    private boolean selDown = false;
-    private boolean selLong = false;
-
-    private final Runnable pollRunnable = new Runnable() {
-        @Override
-        public void run() {
-            if (playerPref == 0 && customView == null && webView != null) {
-                webView.evaluateJavascript(DETECT_JS, v -> {
-                    boolean full = "1".equals(v);
-                    if (full != pseudoFull) {
-                        pseudoFull = full;
-                        refreshCursorVisibility();
-                    }
-                });
-            }
-            handler.postDelayed(this, 1500);
-        }
-    };
+    // 0 = Tile (highlight jumps between buttons), 1 = Cursor, 2 = Off
+    private int navMode = 0;
+    private boolean tileBusy = false;
+    private String tileJs = "";
     private float cx, cy;
     private float density = 1f;
 
@@ -114,7 +90,8 @@ public class MainActivity extends Activity {
         getWindow().addFlags(WindowManager.LayoutParams.FLAG_KEEP_SCREEN_ON);
 
         prefs = getSharedPreferences(PREFS, MODE_PRIVATE);
-        cursorMode = prefs.getBoolean(KEY_CURSOR, true);
+        navMode = prefs.getInt(KEY_NAV, 0);
+        loadTileJs();
         density = getResources().getDisplayMetrics().density;
         cx = getResources().getDisplayMetrics().widthPixels / 2f;
         cy = getResources().getDisplayMetrics().heightPixels / 2f;
@@ -146,7 +123,6 @@ public class MainActivity extends Activity {
         cursorView = new CursorView(this);
         root.addView(cursorView, new FrameLayout.LayoutParams(
                 ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.MATCH_PARENT));
-        playerPref = prefs.getInt(KEY_PLAYER, 0);
         refreshCursorVisibility();
 
         String url = prefs.getString(KEY_URL, null);
@@ -225,7 +201,6 @@ public class MainActivity extends Activity {
     public boolean dispatchKeyEvent(KeyEvent e) {
         int code = e.getKeyCode();
         boolean down = e.getAction() == KeyEvent.ACTION_DOWN;
-        boolean player = playerMode();
 
         if (code == KeyEvent.KEYCODE_MENU) {
             if (down && e.getRepeatCount() == 0) showMenu();
@@ -234,23 +209,15 @@ public class MainActivity extends Activity {
 
         switch (code) {
             case KeyEvent.KEYCODE_MEDIA_PLAY_PAUSE:
-                if (down && e.getRepeatCount() == 0) togglePlay();
-                return true;
             case KeyEvent.KEYCODE_MEDIA_PLAY:
             case KeyEvent.KEYCODE_MEDIA_PAUSE:
                 if (down && e.getRepeatCount() == 0) togglePlay();
                 return true;
             case KeyEvent.KEYCODE_MEDIA_FAST_FORWARD:
-                if (down) {
-                    if (player) seek(10);
-                    else scrollPage(0, (int) (root.getHeight() * 0.7f));
-                }
+                if (down) seek(10);
                 return true;
             case KeyEvent.KEYCODE_MEDIA_REWIND:
-                if (down) {
-                    if (player) seek(-10);
-                    else scrollPage(0, -(int) (root.getHeight() * 0.7f));
-                }
+                if (down) seek(-10);
                 return true;
             default:
                 break;
@@ -265,26 +232,16 @@ public class MainActivity extends Activity {
                 || code == KeyEvent.KEYCODE_DPAD_LEFT
                 || code == KeyEvent.KEYCODE_DPAD_RIGHT;
 
-        if (player) {
-            // Video is full screen: the remote controls the player.
-            // Tap Select = play/pause. Hold Select = show/hide the cursor
-            // (for subtitle / quality buttons inside the player).
-            if (isSelect) {
-                handlePlayerSelect(e, down);
-                return true;
-            }
+        if (navMode == 0) {
             if (isDpad) {
-                if (cursorOverride) {
-                    if (down) moveCursor(code, e.getRepeatCount());
-                } else if (down) {
-                    if (code == KeyEvent.KEYCODE_DPAD_LEFT) seek(-10);
-                    else if (code == KeyEvent.KEYCODE_DPAD_RIGHT) seek(10);
-                    else if (code == KeyEvent.KEYCODE_DPAD_UP) changeVolume(true);
-                    else changeVolume(false);
-                }
+                if (down) tileMove(code);
                 return true;
             }
-        } else if (cursorMode) {
+            if (isSelect) {
+                if (down && e.getRepeatCount() == 0) tileSelect();
+                return true;
+            }
+        } else if (navMode == 1) {
             if (isDpad) {
                 if (down) moveCursor(code, e.getRepeatCount());
                 return true;
@@ -295,30 +252,6 @@ public class MainActivity extends Activity {
             }
         }
         return super.dispatchKeyEvent(e);
-    }
-
-    private void handlePlayerSelect(KeyEvent e, boolean down) {
-        if (down) {
-            if (e.getRepeatCount() == 0) {
-                selDown = true;
-                selLong = false;
-            } else if (selDown && !selLong) {
-                // Held down: toggle the cursor.
-                selLong = true;
-                cursorOverride = !cursorOverride;
-                refreshCursorVisibility();
-                Toast.makeText(this, cursorOverride
-                        ? "Cursor ON (hold Select to hide)"
-                        : "Cursor OFF", Toast.LENGTH_SHORT).show();
-            }
-        } else {
-            if (selDown && !selLong) {
-                if (cursorOverride) clickAtCursor();
-                else togglePlay();
-            }
-            selDown = false;
-            selLong = false;
-        }
     }
 
     @Override
@@ -334,21 +267,68 @@ public class MainActivity extends Activity {
         showMenu();
     }
 
-    // ------------------------------------------------------ player control
+    // ------------------------------------------------------------ tile mode
 
-    private boolean playerMode() {
-        if (customView != null) return true;
-        if (playerPref == 1) return true;
-        if (playerPref == 2) return false;
-        return pseudoFull;
+    private void loadTileJs() {
+        try (InputStream in = getAssets().open("tile.js")) {
+            tileJs = readAll(in);
+        } catch (IOException ex) {
+            tileJs = "";
+        }
     }
+
+    // Runs a call into tile.js. The script is injected on first use (and again
+    // after every full page load, because the page forgets it).
+    private void runTile(final String call, final ValueCallback<String> cb) {
+        final String guarded = "(window.__tvNav ? " + call + " : 'noinit')";
+        webView.evaluateJavascript(guarded, value -> {
+            if (value != null && value.contains("noinit") && !tileJs.isEmpty()) {
+                webView.evaluateJavascript(tileJs, x ->
+                        webView.evaluateJavascript(guarded, cb));
+            } else {
+                cb.onReceiveValue(value);
+            }
+        });
+    }
+
+    private void tileMove(int keyCode) {
+        if (tileBusy) return; // ignore key repeats while the page is still busy
+        String dir;
+        switch (keyCode) {
+            case KeyEvent.KEYCODE_DPAD_UP: dir = "up"; break;
+            case KeyEvent.KEYCODE_DPAD_DOWN: dir = "down"; break;
+            case KeyEvent.KEYCODE_DPAD_LEFT: dir = "left"; break;
+            default: dir = "right"; break;
+        }
+        tileBusy = true;
+        handler.postDelayed(() -> tileBusy = false, 1500); // safety reset
+        runTile("window.__tvNav('" + dir + "'," + root.getWidth() + ")", v -> tileBusy = false);
+    }
+
+    private void tileSelect() {
+        runTile("window.__tvSel(" + root.getWidth() + ")", value -> {
+            if (value == null) return;
+            String t = value.trim();
+            if (t.equals("null")) {
+                // Nothing highlighted yet: highlight something first.
+                runTile("window.__tvNav('start'," + root.getWidth() + ")", v -> { });
+                return;
+            }
+            if (!t.startsWith("[")) return;
+            try {
+                String[] p = t.substring(1, t.length() - 1).split(",");
+                tapAt(Float.parseFloat(p[0]), Float.parseFloat(p[1]));
+            } catch (Exception ignored) {
+                // bad value, do nothing
+            }
+        });
+    }
+
+    // ------------------------------------------------------- player control
 
     private void refreshCursorVisibility() {
         if (cursorView == null) return;
-        boolean player = playerMode();
-        if (!player) cursorOverride = false;
-        boolean show = player ? cursorOverride : cursorMode;
-        cursorView.setVisibility(show ? View.VISIBLE : View.GONE);
+        cursorView.setVisibility(navMode == 1 ? View.VISIBLE : View.GONE);
         cursorView.invalidate();
     }
 
@@ -359,14 +339,6 @@ public class MainActivity extends Activity {
     private void seek(int seconds) {
         videoJs("v.currentTime=Math.max(0,v.currentTime+(" + seconds + "));",
                 seconds > 0 ? KeyEvent.KEYCODE_DPAD_RIGHT : KeyEvent.KEYCODE_DPAD_LEFT);
-    }
-
-    private void changeVolume(boolean up) {
-        AudioManager am = (AudioManager) getSystemService(Context.AUDIO_SERVICE);
-        if (am == null) return;
-        am.adjustStreamVolume(AudioManager.STREAM_MUSIC,
-                up ? AudioManager.ADJUST_RAISE : AudioManager.ADJUST_LOWER,
-                AudioManager.FLAG_SHOW_UI);
     }
 
     // Runs on a <video> in the page. If the video lives inside another site's
@@ -386,9 +358,11 @@ public class MainActivity extends Activity {
         webView.dispatchKeyEvent(new KeyEvent(t, t + 20, KeyEvent.ACTION_UP, keyCode, 0));
     }
 
+    // -------------------------------------------------------------- cursor
+
     // Scrolls whatever is under the cursor (page or an inner scroll box).
     private void scrollPage(int dxPx, int dyPx) {
-        String js = "(function(x,y,dx,dy){var r=window.devicePixelRatio||1;dx=dx/r;dy=dy/r;"
+        String js = "(function(x,y,dx,dy,nw){var r=nw/window.innerWidth;dx=dx/r;dy=dy/r;"
                 + "function can(el){var cs=getComputedStyle(el);"
                 + "if(dy>0&&/(auto|scroll)/.test(cs.overflowY)&&el.scrollTop+el.clientHeight<el.scrollHeight-1)return true;"
                 + "if(dy<0&&/(auto|scroll)/.test(cs.overflowY)&&el.scrollTop>0)return true;"
@@ -399,11 +373,9 @@ public class MainActivity extends Activity {
                 + "while(el&&el!==document.documentElement){"
                 + "if(can(el)){el.scrollBy(dx,dy);return;}el=el.parentElement;}"
                 + "window.scrollBy(dx,dy);})("
-                + (int) cx + "," + (int) cy + "," + dxPx + "," + dyPx + ");";
+                + (int) cx + "," + (int) cy + "," + dxPx + "," + dyPx + "," + root.getWidth() + ");";
         webView.evaluateJavascript(js, null);
     }
-
-    // -------------------------------------------------------------- cursor
 
     private void moveCursor(int keyCode, int repeat) {
         float step = (14 + Math.min(repeat, 30) * 5) * density;
@@ -428,19 +400,21 @@ public class MainActivity extends Activity {
         cy = Math.max(0, Math.min(h - 1, ny));
         cursorView.invalidate();
 
-        // Near a screen edge: scroll the page too (not while a video is full screen).
-        if (!playerMode()) {
-            if (dy < 0 && ny < edge) scrollPage(0, -scrollStep);
-            else if (dy > 0 && ny > h - edge) scrollPage(0, scrollStep);
-            else if (dx < 0 && nx < edge) scrollPage(-scrollStep, 0);
-            else if (dx > 0 && nx > w - edge) scrollPage(scrollStep, 0);
-        }
+        // Near a screen edge: scroll the page too.
+        if (dy < 0 && ny < edge) scrollPage(0, -scrollStep);
+        else if (dy > 0 && ny > h - edge) scrollPage(0, scrollStep);
+        else if (dx < 0 && nx < edge) scrollPage(-scrollStep, 0);
+        else if (dx > 0 && nx > w - edge) scrollPage(scrollStep, 0);
     }
 
     private void clickAtCursor() {
+        tapAt(cx, cy);
+    }
+
+    // A real finger tap at screen position (x, y), so the page treats it as a
+    // genuine click (needed for fullscreen, the on-screen keyboard, etc).
+    private void tapAt(final float x, final float y) {
         final View target = root;
-        final float x = cx;
-        final float y = cy;
         final long downTime = SystemClock.uptimeMillis();
 
         MotionEvent down = MotionEvent.obtain(downTime, downTime, MotionEvent.ACTION_DOWN, x, y, 0);
@@ -482,10 +456,10 @@ public class MainActivity extends Activity {
 
     // ---------------------------------------------------------------- menu
 
-    private String playerPrefName(int v) {
-        if (v == 1) return "Always ON";
-        if (v == 2) return "Always OFF";
-        return "Auto";
+    private String navName(int v) {
+        if (v == 1) return "Cursor";
+        if (v == 2) return "Off";
+        return "Tile";
     }
 
     private void showMenu() {
@@ -495,8 +469,7 @@ public class MainActivity extends Activity {
                 "Go to home page",
                 "Reload page",
                 "Clear cache & cookies",
-                "Cursor mode: " + (cursorMode ? "ON (tap to turn off)" : "OFF (tap to turn on)"),
-                "Player controls: " + playerPrefName(playerPref) + " (tap to switch)",
+                "Remote mode: " + navName(navMode) + " (tap to switch)",
                 "Browser mode: " + uaName(prefs.getInt(KEY_UA, 1)) + " (tap to switch)",
                 "Check for updates (installed: build " + BuildConfig.VERSION_CODE + ")",
                 "Exit app"
@@ -524,29 +497,24 @@ public class MainActivity extends Activity {
                             Toast.makeText(this, "Cache and cookies cleared", Toast.LENGTH_SHORT).show();
                             break;
                         case 4:
-                            cursorMode = !cursorMode;
-                            prefs.edit().putBoolean(KEY_CURSOR, cursorMode).apply();
+                            navMode = (navMode + 1) % 3;
+                            prefs.edit().putInt(KEY_NAV, navMode).apply();
                             refreshCursorVisibility();
-                            break;
-                        case 5:
-                            playerPref = (playerPref + 1) % 3;
-                            prefs.edit().putInt(KEY_PLAYER, playerPref).apply();
-                            pseudoFull = false;
-                            refreshCursorVisibility();
-                            Toast.makeText(this, "Player controls: " + playerPrefName(playerPref),
+                            webView.evaluateJavascript("window.__tvOff&&window.__tvOff();", null);
+                            Toast.makeText(this, "Remote mode: " + navName(navMode),
                                     Toast.LENGTH_SHORT).show();
                             break;
-                        case 6:
+                        case 5:
                             int next = (prefs.getInt(KEY_UA, 1) + 1) % 3;
                             prefs.edit().putInt(KEY_UA, next).apply();
                             applyUserAgent();
                             Toast.makeText(this, "Browser mode: " + uaName(next), Toast.LENGTH_SHORT).show();
                             webView.reload();
                             break;
-                        case 7:
+                        case 6:
                             checkForUpdates(true);
                             break;
-                        case 8:
+                        case 7:
                             finish();
                             break;
                         default:
@@ -777,7 +745,6 @@ public class MainActivity extends Activity {
     @Override
     protected void onPause() {
         super.onPause();
-        handler.removeCallbacks(pollRunnable);
         webView.onPause();
     }
 
@@ -785,8 +752,6 @@ public class MainActivity extends Activity {
     protected void onResume() {
         super.onResume();
         webView.onResume();
-        handler.removeCallbacks(pollRunnable);
-        handler.postDelayed(pollRunnable, 1500);
     }
 
     @Override
