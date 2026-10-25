@@ -9,6 +9,7 @@ import android.provider.Settings;
 import androidx.core.content.FileProvider;
 import org.json.JSONArray;
 import org.json.JSONObject;
+import java.io.ByteArrayInputStream;
 import java.io.ByteArrayOutputStream;
 import java.io.File;
 import java.io.FileOutputStream;
@@ -39,6 +40,7 @@ import android.webkit.CookieManager;
 import android.webkit.ValueCallback;
 import android.webkit.WebChromeClient;
 import android.webkit.WebResourceRequest;
+import android.webkit.WebResourceResponse;
 import android.webkit.WebSettings;
 import android.webkit.WebStorage;
 import android.webkit.WebView;
@@ -55,6 +57,22 @@ public class MainActivity extends Activity {
     private static final String KEY_CURSOR = "cursor";
     private static final String KEY_UA = "uamode";
     private static final String KEY_NAV = "nav";
+    private static final String KEY_ADBLOCK = "adblock";
+    // Ad / tracker / pop-up networks that are blocked (speeds pages up a lot).
+    private static final String[] BLOCKED_HOSTS = {
+            "doubleclick.net", "googlesyndication.com", "googleadservices.com",
+            "googletagservices.com", "googletagmanager.com", "google-analytics.com",
+            "adservice.google.com", "adnxs.com", "taboola.com", "outbrain.com",
+            "popads.net", "popcash.net", "propellerads.com", "exoclick.com",
+            "adsterra.com", "juicyads.com", "trafficjunky.net", "clickadu.com",
+            "hilltopads.net", "adcash.com", "mgid.com", "revcontent.com",
+            "criteo.com", "criteo.net", "scorecardresearch.com", "quantserve.com",
+            "hotjar.com", "amazon-adsystem.com", "histats.com", "statcounter.com",
+            "adform.net", "rubiconproject.com", "pubmatic.com", "openx.net",
+            "smartadserver.com", "onclickads.net", "a-ads.com", "admaven.com",
+            "ad-maven.com", "richads.com", "connect.facebook.net",
+            "adskeeper.com", "monetag.com", "profitablecpmrate.com"
+    };
     private static final String UA_DESKTOP =
             "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) "
                     + "Chrome/130.0.0.0 Safari/537.36";
@@ -80,6 +98,7 @@ public class MainActivity extends Activity {
     // 0 = Tile (highlight jumps between buttons), 1 = Cursor, 2 = Off
     private int navMode = 0;
     private boolean tileBusy = false;
+    private boolean adBlock = true;
     private String tileJs = "";
     private float cx, cy;
     private float density = 1f;
@@ -91,6 +110,7 @@ public class MainActivity extends Activity {
 
         prefs = getSharedPreferences(PREFS, MODE_PRIVATE);
         navMode = prefs.getInt(KEY_NAV, 0);
+        adBlock = prefs.getBoolean(KEY_ADBLOCK, true);
         loadTileJs();
         density = getResources().getDisplayMetrics().density;
         cx = getResources().getDisplayMetrics().widthPixels / 2f;
@@ -159,6 +179,18 @@ public class MainActivity extends Activity {
         webView.setFocusableInTouchMode(true);
 
         webView.setWebViewClient(new WebViewClient() {
+            @Override
+            public WebResourceResponse shouldInterceptRequest(WebView view, WebResourceRequest request) {
+                if (adBlock) {
+                    String host = request.getUrl().getHost();
+                    if (host != null && isBlockedHost(host.toLowerCase())) {
+                        return new WebResourceResponse("text/plain", "utf-8",
+                                new ByteArrayInputStream(new byte[0]));
+                    }
+                }
+                return null;
+            }
+
             @Override
             public boolean shouldOverrideUrlLoading(WebView view, WebResourceRequest request) {
                 String u = request.getUrl().toString().toLowerCase();
@@ -269,6 +301,13 @@ public class MainActivity extends Activity {
 
     // ------------------------------------------------------------ tile mode
 
+    private static boolean isBlockedHost(String host) {
+        for (String b : BLOCKED_HOSTS) {
+            if (host.equals(b) || host.endsWith("." + b)) return true;
+        }
+        return false;
+    }
+
     private void loadTileJs() {
         try (InputStream in = getAssets().open("tile.js")) {
             tileJs = readAll(in);
@@ -310,8 +349,18 @@ public class MainActivity extends Activity {
             if (value == null) return;
             String t = value.trim();
             if (t.equals("null")) {
-                // Nothing highlighted yet: highlight something first.
-                runTile("window.__tvNav('start'," + root.getWidth() + ")", v -> { });
+                // Highlight is hidden. Full screen video: Select = play/pause.
+                // Otherwise just bring the highlight back.
+                if (customView != null) {
+                    togglePlay();
+                    return;
+                }
+                String js = "(function(){var vs=document.getElementsByTagName('video');"
+                        + "for(var i=0;i<vs.length;i++){if(!vs[i].paused)return 1;}return 0;})();";
+                webView.evaluateJavascript(js, pv -> {
+                    if ("1".equals(pv)) togglePlay();
+                    else runTile("window.__tvNav('start'," + root.getWidth() + ")", v -> { });
+                });
                 return;
             }
             if (!t.startsWith("[")) return;
@@ -337,7 +386,7 @@ public class MainActivity extends Activity {
     }
 
     // Fast-forward / Rewind: seek if a video is playing (or full screen),
-    // otherwise scroll the page down / up.
+    // otherwise scroll sideways (e.g. rows of posters).
     private void skipOrScroll(final int dir) {
         if (customView != null) {
             seek(dir * 10);
@@ -349,7 +398,7 @@ public class MainActivity extends Activity {
                 + "return 0;})();";
         webView.evaluateJavascript(js, value -> {
             if (!"1".equals(value)) {
-                runTile("window.__tvPage('" + (dir > 0 ? "down" : "up") + "')", v -> { });
+                runTile("window.__tvPage('" + (dir > 0 ? "right" : "left") + "')", v -> { });
             }
         });
     }
@@ -446,7 +495,7 @@ public class MainActivity extends Activity {
             up.setSource(InputDevice.SOURCE_TOUCHSCREEN);
             target.dispatchTouchEvent(up);
             up.recycle();
-        }, 60);
+        }, 30);
     }
 
     private class CursorView extends View {
@@ -489,6 +538,7 @@ public class MainActivity extends Activity {
                 "Clear cache & cookies",
                 "Remote mode: " + navName(navMode) + " (tap to switch)",
                 "Browser mode: " + uaName(prefs.getInt(KEY_UA, 1)) + " (tap to switch)",
+                "Ad & tracker blocker: " + (adBlock ? "ON (tap to turn off)" : "OFF (tap to turn on)"),
                 "Check for updates (installed: build " + BuildConfig.VERSION_CODE + ")",
                 "Exit app"
         };
@@ -530,9 +580,16 @@ public class MainActivity extends Activity {
                             webView.reload();
                             break;
                         case 6:
-                            checkForUpdates(true);
+                            adBlock = !adBlock;
+                            prefs.edit().putBoolean(KEY_ADBLOCK, adBlock).apply();
+                            Toast.makeText(this, "Ad & tracker blocker: " + (adBlock ? "ON" : "OFF"),
+                                    Toast.LENGTH_SHORT).show();
+                            webView.reload();
                             break;
                         case 7:
+                            checkForUpdates(true);
+                            break;
+                        case 8:
                             finish();
                             break;
                         default:
