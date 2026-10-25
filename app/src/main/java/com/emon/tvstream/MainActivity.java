@@ -17,17 +17,24 @@ import java.io.IOException;
 import java.io.InputStream;
 import java.net.HttpURLConnection;
 import java.net.URL;
+import java.util.ArrayList;
+import java.util.List;
 import android.app.AlertDialog;
 import android.content.Context;
 import android.content.SharedPreferences;
 import android.graphics.Canvas;
 import android.graphics.Color;
 import android.graphics.Paint;
+import android.graphics.Typeface;
+import android.graphics.drawable.Drawable;
+import android.graphics.drawable.GradientDrawable;
+import android.graphics.drawable.StateListDrawable;
 import android.os.Bundle;
 import android.os.Handler;
 import android.os.Looper;
 import android.os.SystemClock;
 import android.text.InputType;
+import android.text.TextUtils;
 import android.view.Gravity;
 import android.view.InputDevice;
 import android.view.KeyEvent;
@@ -47,6 +54,9 @@ import android.webkit.WebView;
 import android.webkit.WebViewClient;
 import android.widget.EditText;
 import android.widget.FrameLayout;
+import android.widget.GridLayout;
+import android.widget.LinearLayout;
+import android.widget.ScrollView;
 import android.widget.TextView;
 import android.widget.Toast;
 
@@ -57,6 +67,12 @@ public class MainActivity extends Activity {
     private static final String KEY_CURSOR = "cursor";
     private static final String KEY_UA = "uamode";
     private static final String KEY_NAV = "nav";
+    private static final String KEY_SITES = "sites";
+    private static final String KEY_LAST = "last";
+    private static final int[] PALETTE = {
+            0xFF1E3A8A, 0xFF7C2D12, 0xFF14532D, 0xFF581C87,
+            0xFF831843, 0xFF134E4A, 0xFF3F3F46, 0xFF78350F
+    };
     private static final String KEY_ADBLOCK = "adblock";
     // Ad / tracker / pop-up networks that are blocked (speeds pages up a lot).
     private static final String[] BLOCKED_HOSTS = {
@@ -99,6 +115,13 @@ public class MainActivity extends Activity {
     private int navMode = 0;
     private boolean tileBusy = false;
     private boolean adBlock = true;
+
+    // "My sites" home screen
+    private List<String[]> sites = new ArrayList<>();
+    private int currentSiteIndex = -1;
+    private boolean homeShown = false;
+    private FrameLayout homeView;
+    private GridLayout homeGrid;
     private String tileJs = "";
     private float cx, cy;
     private float density = 1f;
@@ -143,13 +166,21 @@ public class MainActivity extends Activity {
         cursorView = new CursorView(this);
         root.addView(cursorView, new FrameLayout.LayoutParams(
                 ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.MATCH_PARENT));
+        buildHomeView();
         refreshCursorVisibility();
 
-        String url = prefs.getString(KEY_URL, null);
-        if (url == null) {
-            promptForUrl(true);
+        sites = loadSites();
+        if (sites.isEmpty()) {
+            promptForSite(-1, true);
         } else {
-            webView.loadUrl(url);
+            String last = prefs.getString(KEY_LAST, null);
+            if (last != null) {
+                currentSiteIndex = indexForUrl(last);
+                webView.loadUrl(last);
+            } else {
+                currentSiteIndex = 0;
+                webView.loadUrl(sites.get(0)[1]);
+            }
         }
 
         handler.postDelayed(() -> checkForUpdates(false), 4000);
@@ -179,6 +210,14 @@ public class MainActivity extends Activity {
         webView.setFocusableInTouchMode(true);
 
         webView.setWebViewClient(new WebViewClient() {
+            @Override
+            public void doUpdateVisitedHistory(WebView view, String url, boolean isReload) {
+                super.doUpdateVisitedHistory(view, url, isReload);
+                if (url != null && (url.startsWith("http://") || url.startsWith("https://"))) {
+                    prefs.edit().putString(KEY_LAST, url).apply();
+                }
+            }
+
             @Override
             public WebResourceResponse shouldInterceptRequest(WebView view, WebResourceRequest request) {
                 if (adBlock) {
@@ -239,6 +278,10 @@ public class MainActivity extends Activity {
             return true;
         }
 
+        if (homeShown) {
+            return super.dispatchKeyEvent(e);
+        }
+
         switch (code) {
             case KeyEvent.KEYCODE_MEDIA_PLAY_PAUSE:
             case KeyEvent.KEYCODE_MEDIA_PLAY:
@@ -288,6 +331,12 @@ public class MainActivity extends Activity {
 
     @Override
     public void onBackPressed() {
+        if (homeShown) {
+            String cur = webView.getUrl();
+            if (cur != null && !cur.startsWith("about:")) hideHome();
+            else finish();
+            return;
+        }
         if (customView != null) {
             chromeClient.onHideCustomView();
             return;
@@ -296,7 +345,7 @@ public class MainActivity extends Activity {
             webView.goBack();
             return;
         }
-        showMenu();
+        showHome();
     }
 
     // ------------------------------------------------------------ tile mode
@@ -379,6 +428,7 @@ public class MainActivity extends Activity {
         if (cursorView == null) return;
         cursorView.setVisibility(navMode == 1 ? View.VISIBLE : View.GONE);
         cursorView.invalidate();
+        if (menuButton != null) menuButton.setVisibility(navMode == 1 ? View.VISIBLE : View.GONE);
     }
 
     private void togglePlay() {
@@ -532,8 +582,9 @@ public class MainActivity extends Activity {
     private void showMenu() {
         if (menuDialog != null && menuDialog.isShowing()) return;
         String[] items = {
-                "Change website",
-                "Go to home page",
+                "My sites",
+                "Go to this site's start page",
+                "Edit this site",
                 "Reload page",
                 "Clear cache & cookies",
                 "Remote mode: " + navName(navMode) + " (tap to switch)",
@@ -547,16 +598,22 @@ public class MainActivity extends Activity {
                 .setItems(items, (dialog, which) -> {
                     switch (which) {
                         case 0:
-                            promptForUrl(false);
+                            showHome();
                             break;
                         case 1:
-                            String home = prefs.getString(KEY_URL, null);
-                            if (home != null) webView.loadUrl(home);
+                            if (currentSiteIndex >= 0 && currentSiteIndex < sites.size()) {
+                                webView.loadUrl(sites.get(currentSiteIndex)[1]);
+                            } else {
+                                showHome();
+                            }
                             break;
                         case 2:
-                            webView.reload();
+                            promptForSite(currentSiteIndex, false);
                             break;
                         case 3:
+                            webView.reload();
+                            break;
+                        case 4:
                             webView.clearCache(true);
                             webView.clearHistory();
                             WebStorage.getInstance().deleteAllData();
@@ -564,7 +621,7 @@ public class MainActivity extends Activity {
                             CookieManager.getInstance().flush();
                             Toast.makeText(this, "Cache and cookies cleared", Toast.LENGTH_SHORT).show();
                             break;
-                        case 4:
+                        case 5:
                             navMode = (navMode + 1) % 3;
                             prefs.edit().putInt(KEY_NAV, navMode).apply();
                             refreshCursorVisibility();
@@ -572,24 +629,24 @@ public class MainActivity extends Activity {
                             Toast.makeText(this, "Remote mode: " + navName(navMode),
                                     Toast.LENGTH_SHORT).show();
                             break;
-                        case 5:
+                        case 6:
                             int next = (prefs.getInt(KEY_UA, 1) + 1) % 3;
                             prefs.edit().putInt(KEY_UA, next).apply();
                             applyUserAgent();
                             Toast.makeText(this, "Browser mode: " + uaName(next), Toast.LENGTH_SHORT).show();
                             webView.reload();
                             break;
-                        case 6:
+                        case 7:
                             adBlock = !adBlock;
                             prefs.edit().putBoolean(KEY_ADBLOCK, adBlock).apply();
                             Toast.makeText(this, "Ad & tracker blocker: " + (adBlock ? "ON" : "OFF"),
                                     Toast.LENGTH_SHORT).show();
                             webView.reload();
                             break;
-                        case 7:
+                        case 8:
                             checkForUpdates(true);
                             break;
-                        case 8:
+                        case 9:
                             finish();
                             break;
                         default:
@@ -615,26 +672,334 @@ public class MainActivity extends Activity {
         return "TV default";
     }
 
-    private void promptForUrl(final boolean firstRun) {
-        final EditText input = new EditText(this);
-        input.setSingleLine(true);
-        input.setInputType(InputType.TYPE_CLASS_TEXT | InputType.TYPE_TEXT_VARIATION_URI);
-        input.setImeOptions(EditorInfo.IME_ACTION_DONE);
-        input.setHint("https://example.com");
-        String current = prefs.getString(KEY_URL, "");
-        input.setText(current);
-        input.setSelection(input.getText().length());
+    // ----------------------------------------------------------- my sites
+
+    private List<String[]> loadSites() {
+        List<String[]> list = new ArrayList<>();
+        String raw = prefs.getString(KEY_SITES, null);
+        if (raw != null) {
+            try {
+                JSONArray arr = new JSONArray(raw);
+                for (int i = 0; i < arr.length(); i++) {
+                    JSONObject o = arr.getJSONObject(i);
+                    list.add(new String[]{o.optString("n"), o.optString("u")});
+                }
+            } catch (Exception ignored) {
+                // corrupt data: start with an empty list
+            }
+        } else {
+            // Upgrade from the single saved link of older versions.
+            String old = prefs.getString("url", null);
+            if (old != null) {
+                list.add(new String[]{niceName(old), old});
+                saveSites(list);
+            }
+        }
+        return list;
+    }
+
+    private void saveSites(List<String[]> list) {
+        JSONArray arr = new JSONArray();
+        try {
+            for (String[] s : list) {
+                JSONObject o = new JSONObject();
+                o.put("n", s[0]);
+                o.put("u", s[1]);
+                arr.put(o);
+            }
+        } catch (Exception ignored) {
+            return;
+        }
+        prefs.edit().putString(KEY_SITES, arr.toString()).apply();
+    }
+
+    private String hostOf(String url) {
+        try {
+            String h = Uri.parse(url).getHost();
+            return h == null ? "" : h.toLowerCase().replaceFirst("^www\\.", "");
+        } catch (Exception e) {
+            return "";
+        }
+    }
+
+    private String niceName(String url) {
+        String h = hostOf(url);
+        if (h.isEmpty()) return "Site";
+        String base = h.contains(".") ? h.substring(0, h.indexOf('.')) : h;
+        if (base.isEmpty()) return "Site";
+        return Character.toUpperCase(base.charAt(0)) + base.substring(1);
+    }
+
+    private int indexForUrl(String url) {
+        String h = hostOf(url);
+        for (int i = 0; i < sites.size(); i++) {
+            if (hostOf(sites.get(i)[1]).equals(h)) return i;
+        }
+        return -1;
+    }
+
+    private void buildHomeView() {
+        homeView = new FrameLayout(this);
+        homeView.setBackgroundColor(0xFF0B0F1A);
+        homeView.setClickable(true);
+        homeView.setVisibility(View.GONE);
+
+        int pad = (int) (40 * density);
+        LinearLayout col = new LinearLayout(this);
+        col.setOrientation(LinearLayout.VERTICAL);
+        col.setPadding(pad, pad, pad, pad);
+
+        TextView title = new TextView(this);
+        title.setText("My sites");
+        title.setTextColor(Color.WHITE);
+        title.setTextSize(30);
+        title.setTypeface(Typeface.DEFAULT_BOLD);
+        title.setPadding(0, 0, 0, (int) (16 * density));
+        col.addView(title);
+
+        ScrollView scroll = new ScrollView(this);
+        scroll.setFocusable(false);
+        scroll.setClipChildren(false);
+        scroll.setClipToPadding(false);
+        homeGrid = new GridLayout(this);
+        homeGrid.setClipChildren(false);
+        homeGrid.setClipToPadding(false);
+        scroll.addView(homeGrid, new ScrollView.LayoutParams(
+                ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.WRAP_CONTENT));
+        col.addView(scroll, new LinearLayout.LayoutParams(
+                ViewGroup.LayoutParams.MATCH_PARENT, 0, 1f));
+
+        TextView hint = new TextView(this);
+        hint.setText("Select = open     Hold Select = edit or remove     Back = return to the page");
+        hint.setTextColor(0x99FFFFFF);
+        hint.setTextSize(14);
+        hint.setPadding(0, (int) (12 * density), 0, 0);
+        col.addView(hint);
+
+        homeView.addView(col, new FrameLayout.LayoutParams(
+                ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.MATCH_PARENT));
+        root.addView(homeView, new FrameLayout.LayoutParams(
+                ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.MATCH_PARENT));
+    }
+
+    private Drawable tileBackground(int color) {
+        float radius = 14 * density;
+        GradientDrawable normal = new GradientDrawable();
+        normal.setColor(color);
+        normal.setCornerRadius(radius);
+        GradientDrawable focused = new GradientDrawable();
+        focused.setColor(color);
+        focused.setCornerRadius(radius);
+        focused.setStroke((int) (4 * density), 0xFFFFD400);
+        StateListDrawable sl = new StateListDrawable();
+        sl.addState(new int[]{android.R.attr.state_focused}, focused);
+        sl.addState(new int[]{}, normal);
+        return sl;
+    }
+
+    private View makeTile(String name, String sub, int color) {
+        LinearLayout t = new LinearLayout(this);
+        t.setOrientation(LinearLayout.VERTICAL);
+        t.setGravity(Gravity.CENTER);
+        int p = (int) (12 * density);
+        t.setPadding(p, p, p, p);
+        t.setBackground(tileBackground(color));
+        t.setFocusable(true);
+        t.setClickable(true);
+
+        TextView n = new TextView(this);
+        n.setText(name);
+        n.setTextColor(Color.WHITE);
+        n.setTextSize(20);
+        n.setTypeface(Typeface.DEFAULT_BOLD);
+        n.setGravity(Gravity.CENTER);
+        n.setMaxLines(2);
+        n.setEllipsize(TextUtils.TruncateAt.END);
+        t.addView(n);
+
+        if (sub != null && !sub.isEmpty()) {
+            TextView h = new TextView(this);
+            h.setText(sub);
+            h.setTextColor(0xB3FFFFFF);
+            h.setTextSize(13);
+            h.setGravity(Gravity.CENTER);
+            h.setMaxLines(1);
+            h.setEllipsize(TextUtils.TruncateAt.END);
+            t.addView(h);
+        }
+
+        t.setOnFocusChangeListener((v, has) -> v.animate()
+                .scaleX(has ? 1.06f : 1f).scaleY(has ? 1.06f : 1f).setDuration(120).start());
+        return t;
+    }
+
+    private void buildHome() {
+        homeGrid.removeAllViews();
+        int widthPx = getResources().getDisplayMetrics().widthPixels;
+        int pad = (int) (40 * density);
+        int margin = (int) (8 * density);
+        int target = (int) (210 * density);
+        int cols = Math.max(2, (widthPx - 2 * pad) / (target + 2 * margin));
+        int tileW = (widthPx - 2 * pad) / cols - 2 * margin;
+        int tileH = (int) (112 * density);
+        homeGrid.setColumnCount(cols);
+
+        View focusTarget = null;
+        for (int i = 0; i < sites.size(); i++) {
+            final int idx = i;
+            String[] s = sites.get(i);
+            View t = makeTile(s[0], hostOf(s[1]), PALETTE[Math.abs(s[0].hashCode()) % PALETTE.length]);
+            t.setOnClickListener(v -> openSite(idx));
+            t.setOnLongClickListener(v -> {
+                siteOptions(idx);
+                return true;
+            });
+            homeGrid.addView(t, tileParams(tileW, tileH, margin));
+            if (focusTarget == null || i == currentSiteIndex) focusTarget = t;
+        }
+
+        View add = makeTile("+  Add site", "", 0xFF374151);
+        add.setOnClickListener(v -> promptForSite(-1, false));
+        homeGrid.addView(add, tileParams(tileW, tileH, margin));
+
+        View menu = makeTile("\u2630  Menu", "", 0xFF374151);
+        menu.setOnClickListener(v -> showMenu());
+        homeGrid.addView(menu, tileParams(tileW, tileH, margin));
+
+        if (focusTarget == null) focusTarget = add;
+        final View ft = focusTarget;
+        homeView.post(ft::requestFocus);
+    }
+
+    private GridLayout.LayoutParams tileParams(int w, int h, int margin) {
+        GridLayout.LayoutParams lp = new GridLayout.LayoutParams();
+        lp.width = w;
+        lp.height = h;
+        lp.setMargins(margin, margin, margin, margin);
+        return lp;
+    }
+
+    private void showHome() {
+        if (homeShown) return;
+        homeShown = true;
+        buildHome();
+        homeView.setVisibility(View.VISIBLE);
+        homeView.bringToFront();
+        webView.setFocusable(false);
+        webView.setFocusableInTouchMode(false);
+        // Stop any sound from the page while the site list is open.
+        webView.evaluateJavascript("(function(){var m=document.querySelectorAll('video,audio');"
+                + "for(var i=0;i<m.length;i++){try{m[i].pause();}catch(e){}}})();", null);
+        webView.onPause();
+    }
+
+    private void hideHome() {
+        if (!homeShown) return;
+        homeShown = false;
+        homeView.setVisibility(View.GONE);
+        webView.setFocusable(true);
+        webView.setFocusableInTouchMode(true);
+        webView.onResume();
+        webView.requestFocus();
+    }
+
+    private void openSite(int idx) {
+        if (idx < 0 || idx >= sites.size()) return;
+        String[] s = sites.get(idx);
+        currentSiteIndex = idx;
+        String cur = webView.getUrl();
+        boolean sameSite = cur != null && !cur.startsWith("about:")
+                && hostOf(cur).equals(hostOf(s[1]));
+        hideHome();
+        if (!sameSite) webView.loadUrl(s[1]); // same site: just go back to where you were
+    }
+
+    private void siteOptions(final int idx) {
+        if (idx < 0 || idx >= sites.size()) return;
+        String[] items = {"Open (start page)", "Edit name or link", "Remove"};
+        new AlertDialog.Builder(this, AlertDialog.THEME_DEVICE_DEFAULT_DARK)
+                .setTitle(sites.get(idx)[0])
+                .setItems(items, (d, which) -> {
+                    if (which == 0) {
+                        currentSiteIndex = idx;
+                        hideHome();
+                        webView.loadUrl(sites.get(idx)[1]);
+                    } else if (which == 1) {
+                        promptForSite(idx, false);
+                    } else {
+                        confirmRemove(idx);
+                    }
+                })
+                .show();
+    }
+
+    private void confirmRemove(final int idx) {
+        new AlertDialog.Builder(this, AlertDialog.THEME_DEVICE_DEFAULT_DARK)
+                .setTitle("Remove " + sites.get(idx)[0] + "?")
+                .setPositiveButton("Remove", (d, w) -> {
+                    sites.remove(idx);
+                    saveSites(sites);
+                    if (currentSiteIndex == idx) currentSiteIndex = -1;
+                    else if (currentSiteIndex > idx) currentSiteIndex--;
+                    if (homeShown) buildHome();
+                })
+                .setNegativeButton("Cancel", null)
+                .show();
+    }
+
+    // Add (index = -1) or edit a saved site.
+    private void promptForSite(final int index, final boolean firstRun) {
+        final boolean editing = index >= 0 && index < sites.size();
+        int p = (int) (20 * density);
+        LinearLayout form = new LinearLayout(this);
+        form.setOrientation(LinearLayout.VERTICAL);
+        form.setPadding(p, p / 2, p, 0);
+
+        final EditText nameIn = new EditText(this);
+        nameIn.setSingleLine(true);
+        nameIn.setInputType(InputType.TYPE_CLASS_TEXT | InputType.TYPE_TEXT_FLAG_CAP_WORDS);
+        nameIn.setImeOptions(EditorInfo.IME_ACTION_NEXT);
+        nameIn.setHint("Name (e.g. Movies)");
+        form.addView(nameIn);
+
+        final EditText linkIn = new EditText(this);
+        linkIn.setSingleLine(true);
+        linkIn.setInputType(InputType.TYPE_CLASS_TEXT | InputType.TYPE_TEXT_VARIATION_URI);
+        linkIn.setImeOptions(EditorInfo.IME_ACTION_DONE);
+        linkIn.setHint("https://example.com");
+        form.addView(linkIn);
+
+        if (editing) {
+            nameIn.setText(sites.get(index)[0]);
+            linkIn.setText(sites.get(index)[1]);
+            linkIn.setSelection(linkIn.getText().length());
+        }
 
         final AlertDialog dlg = new AlertDialog.Builder(this, AlertDialog.THEME_DEVICE_DEFAULT_DARK)
-                .setTitle("Enter website link")
-                .setView(input)
-                .setPositiveButton("Save & open", (d, w) -> {
-                    String u = normalizeUrl(input.getText().toString());
+                .setTitle(editing ? "Edit site" : "Add a site")
+                .setView(form)
+                .setPositiveButton("Save", (d, w) -> {
+                    String u = normalizeUrl(linkIn.getText().toString());
                     if (u == null) {
                         Toast.makeText(this, "Invalid link, try again", Toast.LENGTH_LONG).show();
-                        promptForUrl(firstRun);
+                        promptForSite(index, firstRun);
+                        return;
+                    }
+                    String name = nameIn.getText().toString().trim();
+                    if (name.isEmpty()) name = niceName(u);
+                    int at;
+                    if (editing) {
+                        sites.set(index, new String[]{name, u});
+                        at = index;
                     } else {
-                        prefs.edit().putString(KEY_URL, u).apply();
+                        sites.add(new String[]{name, u});
+                        at = sites.size() - 1;
+                    }
+                    saveSites(sites);
+                    if (homeShown) {
+                        buildHome();
+                    } else {
+                        currentSiteIndex = at;
                         webView.loadUrl(u);
                     }
                 })
@@ -644,7 +1009,7 @@ public class MainActivity extends Activity {
                 .setCancelable(!firstRun)
                 .create();
 
-        input.setOnEditorActionListener((tv, actionId, ev) -> {
+        linkIn.setOnEditorActionListener((tv, actionId, ev) -> {
             if (actionId == EditorInfo.IME_ACTION_DONE) {
                 dlg.getButton(AlertDialog.BUTTON_POSITIVE).performClick();
                 return true;
@@ -826,7 +1191,7 @@ public class MainActivity extends Activity {
     @Override
     protected void onResume() {
         super.onResume();
-        webView.onResume();
+        if (!homeShown) webView.onResume();
     }
 
     @Override
