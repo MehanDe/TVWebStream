@@ -8,6 +8,28 @@
   var cur = null;
   var ring = null;
   var stamp = 0;
+  var shown = false;       // is the highlight currently visible?
+  var hideTimer = null;
+  var dirty = true;        // page scrolled/resized since the last full scan
+  var ptrCache = null;     // cached "looks clickable" elements
+  var ptrTime = 0;
+  var ptrRoot = null;
+  var HIDE_MS = 3500;
+
+  // Snappier scrolling: no animated scrolling.
+  try {
+    var st = document.createElement('style');
+    st.textContent = 'html,body,*{scroll-behavior:auto !important}';
+    (document.head || document.documentElement).appendChild(st);
+  } catch (e) {}
+
+  function arm() {
+    if (hideTimer) clearTimeout(hideTimer);
+    hideTimer = setTimeout(function () {
+      shown = false;
+      if (ring) ring.style.display = 'none';
+    }, HIDE_MS);
+  }
 
   function rootEl() {
     return document.fullscreenElement || document.webkitFullscreenElement || document;
@@ -33,7 +55,7 @@
   function drawRing() {
     if (!cur) return;
     var rg = ensureRing();
-    if (!cur.isConnected) { rg.style.display = 'none'; return; }
+    if (!shown || !cur.isConnected) { rg.style.display = 'none'; return; }
     var r = cur.getBoundingClientRect();
     if (r.width === 0 && r.height === 0) { rg.style.display = 'none'; return; }
     rg.style.display = 'block';
@@ -81,20 +103,39 @@
     }
 
     // Things that look clickable (cursor:pointer). Keep only the outermost one.
-    list = r0.querySelectorAll('div,span,li,img,svg,i,label,p,section,article,figure');
-    var n = Math.min(list.length, 6000);
-    for (i = 0; i < n; i++) {
-      el = list[i];
-      if (el.__tvS === stamp) continue;
-      r = el.getBoundingClientRect();
-      if (r.width < 8 || r.height < 8 || !inView(r)) continue;
-      var cs = getComputedStyle(el);
-      if (cs.cursor !== 'pointer') continue;
-      var p = el.parentElement;
-      if (p && getComputedStyle(p).cursor === 'pointer') continue;
-      if (!usable(el, r) || !hit(el, r)) continue;
-      el.__tvS = stamp;
-      out.push({ el: el, r: r });
+    // The expensive scan is cached until the page scrolls or 2.5 s pass.
+    var now = Date.now();
+    var base = (r0 === document) ? document : r0;
+    if (!dirty && ptrCache && ptrRoot === base && now - ptrTime < 2500) {
+      for (i = 0; i < ptrCache.length; i++) {
+        el = ptrCache[i];
+        if (!el.isConnected || el.__tvS === stamp) continue;
+        r = el.getBoundingClientRect();
+        if (!usable(el, r) || !hit(el, r)) continue;
+        el.__tvS = stamp;
+        out.push({ el: el, r: r });
+      }
+    } else {
+      ptrCache = [];
+      ptrRoot = base;
+      ptrTime = now;
+      dirty = false;
+      list = r0.querySelectorAll('div,span,li,img,svg,i,label,p,section,article,figure');
+      var n = Math.min(list.length, 4000);
+      for (i = 0; i < n; i++) {
+        el = list[i];
+        if (el.__tvS === stamp) continue;
+        r = el.getBoundingClientRect();
+        if (r.width < 8 || r.height < 8 || !inView(r)) continue;
+        var cs = getComputedStyle(el);
+        if (cs.cursor !== 'pointer') continue;
+        var p = el.parentElement;
+        if (p && getComputedStyle(p).cursor === 'pointer') continue;
+        ptrCache.push(el);
+        if (!usable(el, r) || !hit(el, r)) continue;
+        el.__tvS = stamp;
+        out.push({ el: el, r: r });
+      }
     }
     return out;
   }
@@ -127,6 +168,7 @@
   }
 
   function wake(el) {
+    if (!document.querySelector('video') && !(document.fullscreenElement || document.webkitFullscreenElement)) return;
     try {
       var r = el.getBoundingClientRect();
       var o = { bubbles: true, cancelable: true, view: window,
@@ -141,7 +183,9 @@
     try { if (el.focus) el.focus({ preventScroll: true }); } catch (e) {}
     try { el.scrollIntoView({ block: 'nearest', inline: 'nearest' }); } catch (e) {}
     wake(el);
+    shown = true;
     drawRing();
+    arm();
   }
 
   function canScroll(e, dx, dy) {
@@ -196,11 +240,21 @@
 
   window.__tvNav = function (dir, nativeW) {
     if (cur && !cur.isConnected) cur = null;
+
+    // Highlight was hidden (idle): first press just brings it back.
+    if (cur && !shown) {
+      shown = true;
+      wake(cur);
+      drawRing();
+      arm();
+      return 'reveal';
+    }
+
     var cands = gather();
     var nxt;
 
     if (!cur || dir === 'start') {
-      if (cur) { drawRing(); return 'ring'; }
+      if (cur) { drawRing(); arm(); return 'ring'; }
       nxt = nearestToCenter(cands);
       if (nxt) { setCur(nxt.el); return 'start'; }
       if (dir !== 'start') scrollDir(document.body, dir);
@@ -224,7 +278,8 @@
 
   // Returns the pixel position (in app screen pixels) to tap for the highlighted item.
   window.__tvSel = function (nativeW) {
-    if (!cur || !cur.isConnected) return null;
+    if (!cur || !cur.isConnected || !shown) return null;
+    arm();
     var r = cur.getBoundingClientRect();
     var k = nativeW / window.innerWidth;
     var x = Math.min(Math.max((r.left + r.right) / 2, 1), window.innerWidth - 1);
@@ -236,16 +291,22 @@
 
   // Page up / page down (used by the Rewind / Fast-forward buttons).
   window.__tvPage = function (dir) {
-    scrollDir(cur && cur.isConnected ? cur : document.body, dir);
+    var el = (cur && cur.isConnected) ? cur : null;
+    if (!el) {
+      var c = nearestToCenter(gather());
+      el = c ? c.el : document.body;
+    }
+    scrollDir(el, dir);
     return 'page';
   };
 
   window.__tvOff = function () {
     cur = null;
+    shown = false;
     if (ring) ring.style.display = 'none';
   };
 
-  window.addEventListener('scroll', drawRing, true);
-  window.addEventListener('resize', drawRing);
-  setInterval(drawRing, 400);
+  window.addEventListener('scroll', function () { dirty = true; drawRing(); }, true);
+  window.addEventListener('resize', function () { dirty = true; drawRing(); });
+  setInterval(function () { if (shown) drawRing(); }, 600);
 })();
